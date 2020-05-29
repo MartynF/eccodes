@@ -12,6 +12,121 @@
  *   Enrico Fucile  - 19.06.2007                                           *
  *                                                                         *
  ***************************************************************************/
+#include <stdlib.h>
+#include <stdint.h>
+#ifdef __GNUC__
+//define restrict will work with GCC and ICC for c89 support of restrict
+#define RESTRICT __restrict
+#else
+#warn "no support for restrict keyword"
+#define RESTRICT
+#endif
+
+static void encode_double_array_opt(size_t n_vals,const double* RESTRICT val,long bits_per_value,
+  const double reference_value,const double d,const double divisor,unsigned char* p,long *off)
+{
+  const size_t block=64;
+
+  size_t ib=0;
+
+  const int bytes_to_copy=bits_per_value/8;
+
+  while(ib<n_vals)
+  {
+    size_t chunk=(n_vals-ib)>block?block:(n_vals-ib);
+
+    double tmp_flt[block];
+    size_t i;
+
+    //#pragma vector always
+    for( i=0;i<chunk;i++)
+    {
+      tmp_flt[i]= ((((val[i+ib]*d)-reference_value)*divisor)+0.5);
+    }
+
+    uint64_t tmp_uint[block];
+    //compute integers in a vectorizable way
+
+    for(i=0;i<chunk;i++)
+    {
+      tmp_uint[i]=(uint64_t) (tmp_flt[i]);
+    }
+
+    //for each integer, byte swap it
+
+    for(i=0;i<chunk;i++)
+    {
+      tmp_uint[i]=__builtin_bswap64(tmp_uint[i]);
+    }
+
+    //now copy bytes per bytes (not optimal)
+    /*for(size_t i=0;i<chunk;i++)
+    {
+      unsigned char* s=&tmp_uint[i];
+      for(int i=0;i<bytes_to_copy;i++)
+      {
+        *p++=s[8-bytes_to_copy+i];
+      }
+    }*/
+    switch (bytes_to_copy)
+    {
+      case 1:
+        for(i=0;i<chunk;i++)
+        {
+          *p++=(tmp_uint[i]>>56)&0xff;
+        }
+      break;
+      case 2:
+        for(i=0;i<chunk;i++)
+        {
+          *((uint16_t*)p)=(tmp_uint[i]>>48)&0xffff;
+          p+=2;
+        }
+      break;
+      case 3:
+        #if 0
+        for(i=0;i<chunk;i++)
+        {
+          *p++=(tmp_uint[i]>>40)&0xff;
+          *((uint16_t*)p)=(tmp_uint[i]>>48)&0xffff;
+          p+=2;
+        }
+        #else
+        for(i=0;i<(chunk-1);i++)
+        {
+          uint32_t dw=tmp_uint[i]>>40&0xffffff;
+          *((uint32_t*)p)=dw;
+          p+=3;
+        }
+        *p++=(tmp_uint[chunk-1]>>40)&0xff;
+        *((uint16_t*)p)=(tmp_uint[chunk-1]>>48)&0xffff;
+        p+=2;
+        #endif
+      break;
+      case 4:
+        for(i=0;i<chunk;i++)
+        {
+          *((uint32_t*)p)=(tmp_uint[i]>>32);
+          p+=4;
+        }
+      break;
+    default:
+      for(i=0;i<chunk;i++)
+      {
+        unsigned char* s=&tmp_uint[i];
+        int j;
+        for(j=0;j<bytes_to_copy;j++)
+        {
+          *p++=s[8-bytes_to_copy+j];
+        }
+      }
+    }
+
+    ib+=chunk;
+  }
+
+  *off+=bits_per_value*n_vals;
+}
 
 /* A mask with x least-significant bits set, possibly 0 or >=32 */
 /* -1UL is 1111111... in every bit in binary representation */
@@ -209,19 +324,22 @@ int grib_encode_double_array(size_t n_vals, const double* val, long bits_per_val
             grib_encode_unsigned_longb(encoded, unsigned_val, off, bits_per_value);
         }
     }
-    else {
-        for (i = 0; i < n_vals; i++) {
-            int blen     = 0;
-            blen         = bits_per_value;
-            x            = ((((val[i] * d) - reference_value) * divisor) + 0.5);
-            unsigned_val = (unsigned long)x;
-            while (blen >= 8) {
-                blen -= 8;
-                *encoded = (unsigned_val >> blen);
-                encoded++;
-                *off += 8;
-            }
-        }
+    else if(bits_per_value==8 || bits_per_value==16 
+	    || bits_per_value==24 || bits_per_value==32) {
+      encode_double_array_opt(n_vals,val,bits_per_value,reference_value,d,divisor,p,off);
+    } else {
+      for (i = 0; i < n_vals; i++) {
+	int blen     = 0;
+	blen         = bits_per_value;
+	x            = ((((val[i] * d) - reference_value) * divisor) + 0.5);
+	unsigned_val = (unsigned long)x;
+	while (blen >= 8) {
+	  blen -= 8;
+	  *encoded = (unsigned_val >> blen);
+	  encoded++;
+	  *off += 8;
+	}
+      }
     }
     return GRIB_SUCCESS;
 }
